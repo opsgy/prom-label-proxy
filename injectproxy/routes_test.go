@@ -109,20 +109,106 @@ func (m *mockUpstream) Close() {
 
 const proxyLabel = "namespace"
 
-func TestEndpointNotImplemented(t *testing.T) {
-	m := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Write(okResponse)
-	}))
+func TestWithPassthroughPaths(t *testing.T) {
+	m := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { w.Write(okResponse) }))
 	defer m.Close()
-	r := NewRoutes(m.url, proxyLabel)
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "http://prometheus.example.com/graph?namespace=ns1", nil)
+	t.Run("invalid passthrough options", func(t *testing.T) {
+		// Duplicated /api.
+		_, err := NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "/api1"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// Wrong format, params in path.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1?args=1", "/api1"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// / is not allowed.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/", "/api2/something", "/api1"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// "" is not allowed.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// Duplication with existing enforced path is not allowed.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "/federate", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// Duplication with existing enforced path is not allowed.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "/federate/", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// Duplication with existing enforced path is not allowed.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "/federate/some", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// Double //.
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2//something", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// api4 is not valid URL path (does not start with /)
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "api4", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// api4/ is not valid URL path (does not start with /)
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "api4/", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		// api4/something is not valid URL path (does not start with /)
+		_, err = NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "api4/something", "/api3"}))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	r, err := NewRoutes(m.url, proxyLabel, WithPassthroughPaths([]string{"/api1", "/api2/something", "/api2/", ""}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	r.ServeHTTP(w, req)
-	resp := w.Result()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected status code 404, got %d", resp.StatusCode)
+	for _, tcase := range []struct {
+		url     string
+		method  string
+		expCode int
+	}{
+		{
+			url: "http://prometheus.example.com/graph?namespace=ns1", method: http.MethodGet,
+			expCode: http.StatusNotFound,
+		},
+		{
+			url: "http://prometheus.example.com/graph?namespace=ns1", method: http.MethodPost,
+			expCode: http.StatusNotFound,
+		},
+		{
+			url: "http://prometheus.example.com/api/v2/silence", method: http.MethodGet,
+			expCode: http.StatusBadRequest, // Missing label to inject.
+		},
+		{
+			url: "http://prometheus.example.com/api1?yolo=ns1", method: http.MethodGet,
+			expCode: http.StatusOK,
+		},
+		{
+			url: "http://prometheus.example.com/api2/something", method: http.MethodGet,
+			expCode: http.StatusOK,
+		},
+	} {
+		t.Run(tcase.url, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(tcase.method, tcase.url, nil))
+			resp := w.Result()
+			if resp.StatusCode != tcase.expCode {
+				t.Fatalf("expected status code %v, got %d", tcase.expCode, resp.StatusCode)
+			}
+		})
 	}
 }
 
@@ -184,7 +270,10 @@ func TestMatch(t *testing.T) {
 					),
 				)
 				defer m.Close()
-				r := NewRoutes(m.url, proxyLabel, WithEnabledLabelsAPI())
+				r, err := NewRoutes(m.url, proxyLabel, WithEnabledLabelsAPI())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				u, err := url.Parse(u)
 				if err != nil {
@@ -379,7 +468,10 @@ func TestQuery(t *testing.T) {
 					),
 				)
 				defer m.Close()
-				r := NewRoutes(m.url, proxyLabel)
+				r, err := NewRoutes(m.url, proxyLabel)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				u, err := url.Parse("http://prometheus.example.com/api/v1/" + endpoint)
 				if err != nil {

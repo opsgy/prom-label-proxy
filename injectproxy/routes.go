@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -32,15 +33,17 @@ const (
 )
 
 type routes struct {
-	upstream  *url.URL
-	handler   http.Handler
-	label     string
+	upstream *url.URL
+	handler  http.Handler
+	label    string
+
 	mux       *http.ServeMux
 	modifiers map[string]func(*http.Response) error
 }
 
 type options struct {
 	enableLabelAPIs bool
+	pasthroughPaths []string
 }
 
 type Option interface {
@@ -60,10 +63,33 @@ func WithEnabledLabelsAPI() Option {
 	})
 }
 
-func NewRoutes(upstream *url.URL, label string, opts ...Option) *routes {
+// WithPassthroughPaths sets path that, if requested, will be forwarded without enforcing label. Use with care.
+// NOTE: Passthrough "all" paths like "/" or "" and regex are not allowed.
+func WithPassthroughPaths(paths []string) Option {
+	return optionFunc(func(o *options) {
+		o.pasthroughPaths = paths
+	})
+}
+
+func NewRoutes(upstream *url.URL, label string, opts ...Option) (*routes, error) {
 	opt := options{}
 	for _, o := range opts {
 		o.apply(&opt)
+	}
+
+	// Validate paths.
+	for _, path := range opt.pasthroughPaths {
+		u, err := url.Parse(fmt.Sprintf("http://example.com%v", path))
+		if err != nil {
+			return nil, fmt.Errorf("path %v is not a valid URI path, got %v", path, opt.pasthroughPaths)
+		}
+		if u.Path != path {
+			return nil, fmt.Errorf("path %v is not a valid URI path, got %v", path, opt.pasthroughPaths)
+		}
+
+		if u.Path == "" || u.Path == "/" {
+			return nil, fmt.Errorf("path %v is not allowed, got %v", u.Path, opt.pasthroughPaths)
+		}
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
@@ -91,13 +117,31 @@ func NewRoutes(upstream *url.URL, label string, opts ...Option) *routes {
 	mux.Handle("/api/v2/silences", enforceMethods(r.silences, "GET", "POST"))
 	mux.Handle("/api/v2/silences/", enforceMethods(r.silences, "GET", "POST"))
 	mux.Handle("/api/v2/silence/", enforceMethods(r.deleteSilence, "DELETE"))
+
+	if err := func() (err error) {
+		defer func() {
+			if rerr := recover(); rerr != nil {
+				err = errors.Errorf("mux.Handler panicked while registering %v", rerr)
+			}
+		}()
+
+		for _, path := range opt.pasthroughPaths {
+			// This can panic if user provided path is overlapping with previously registered. We do recover from this
+			// explicitly.
+			mux.Handle(path, http.HandlerFunc(r.noop))
+		}
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
+
 	r.mux = mux
 	r.modifiers = map[string]func(*http.Response) error{
 		"/api/v1/rules":  modifyAPIResponse(r.filterRules),
 		"/api/v1/alerts": modifyAPIResponse(r.filterAlerts),
 	}
 	proxy.ModifyResponse = r.ModifyResponse
-	return r
+	return r, nil
 }
 
 func (r *routes) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -107,6 +151,7 @@ func (r *routes) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	req = req.WithContext(withLabelValue(req.Context(), lvalue))
+
 	// Remove the proxy label from the query parameters.
 	q := req.URL.Query()
 	q.Del(r.label)
@@ -157,6 +202,10 @@ func withLabelValue(ctx context.Context, label string) context.Context {
 
 func (r *routes) noop(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
+}
+
+func (r *routes) notImplemented(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "Not implemented", http.StatusNotImplemented)
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {
