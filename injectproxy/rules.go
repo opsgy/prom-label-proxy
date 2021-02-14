@@ -163,7 +163,7 @@ type alert struct {
 // modifyAPIResponse unwraps the Prometheus API response, passes the enforced
 // label value and the response to the given function and finally replaces the
 // result in the response.
-func modifyAPIResponse(f func(string, *apiResponse) (interface{}, error)) func(*http.Response) error {
+func modifyAPIResponse(f func([]string, *apiResponse) (interface{}, error)) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		if resp.StatusCode != http.StatusOK {
 			// Pass non-200 responses as-is.
@@ -197,7 +197,7 @@ func modifyAPIResponse(f func(string, *apiResponse) (interface{}, error)) func(*
 	}
 }
 
-func (r *routes) filterRules(lvalue string, resp *apiResponse) (interface{}, error) {
+func (r *routes) filterRules(lvalues []string, resp *apiResponse) (interface{}, error) {
 	var rgs rulesData
 	if err := json.Unmarshal(resp.Data, &rgs); err != nil {
 		return nil, errors.Wrap(err, "can't decode rules data")
@@ -207,11 +207,29 @@ func (r *routes) filterRules(lvalue string, resp *apiResponse) (interface{}, err
 	for _, rg := range rgs.RuleGroups {
 		var rules []rule
 		for _, rule := range rg.Rules {
+			hasMatchingLabel := false
 			for _, lbl := range rule.Labels() {
-				if lbl.Name == r.label && lbl.Value == lvalue {
-					rules = append(rules, rule)
-					break
+				if lbl.Name == r.label {
+					hasMatchingLabel = true
+					matchValues := false
+					// label must match at least one tenant
+					for _, value := range lvalues {
+						if value == lbl.Value {
+							matchValues = true
+							rules = append(rules, rule)
+							break
+						}
+					}
+
+					if matchValues {
+						break
+					}
 				}
+			}
+
+			if !hasMatchingLabel {
+				// consider rules without labels as "global" rules that apply to all tenants
+				rules = append(rules, rule)
 			}
 		}
 		if len(rules) > 0 {
@@ -223,7 +241,7 @@ func (r *routes) filterRules(lvalue string, resp *apiResponse) (interface{}, err
 	return &rulesData{RuleGroups: filtered}, nil
 }
 
-func (r *routes) filterAlerts(lvalue string, resp *apiResponse) (interface{}, error) {
+func (r *routes) filterAlerts(lvalues []string, resp *apiResponse) (interface{}, error) {
 	var data alertsData
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
 		return nil, errors.Wrap(err, "can't decode alerts data")
@@ -231,10 +249,15 @@ func (r *routes) filterAlerts(lvalue string, resp *apiResponse) (interface{}, er
 
 	filtered := []*alert{}
 	for _, alert := range data.Alerts {
+		gotoAlertLoop:
 		for _, lbl := range alert.Labels {
-			if lbl.Name == r.label && lbl.Value == lvalue {
-				filtered = append(filtered, alert)
-				break
+			if lbl.Name == r.label {
+				for _, lvalue := range lvalues {
+					if lbl.Value == lvalue {
+						filtered = append(filtered, alert)
+						break gotoAlertLoop
+					}
+				}
 			}
 		}
 	}

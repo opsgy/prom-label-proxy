@@ -19,31 +19,37 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
 type routes struct {
-	upstream  *url.URL
-	handler   http.Handler
-	label     string
-	mux       *http.ServeMux
-	modifiers map[string]func(*http.Response) error
+	upstream      *url.URL
+	handler       http.Handler
+	label         string
+	labelLocation string
+	mux           *http.ServeMux
+	modifiers     map[string]func(*http.Response) error
 }
 
-func NewRoutes(upstream *url.URL, label string) *routes {
+func NewRoutes(upstream *url.URL, label string, labelLocation string) *routes {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
 	r := &routes{
-		upstream: upstream,
-		handler:  proxy,
-		label:    label,
+		upstream:      upstream,
+		handler:       proxy,
+		label:         label,
+		labelLocation: labelLocation,
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/federate", enforceMethods(r.federate, "GET"))
 	mux.Handle("/api/v1/query", enforceMethods(r.query, "GET", "POST"))
 	mux.Handle("/api/v1/query_range", enforceMethods(r.query, "GET", "POST"))
+	mux.Handle("/api/v1/series", enforceMethods(r.series, "GET", "POST"))
+	mux.Handle("/api/v1/labels", enforceMethods(r.noop, "GET"))
+	mux.Handle("/api/v1/label/__name__/values", enforceMethods(r.noop, "GET"))
 	mux.Handle("/api/v1/alerts", enforceMethods(r.noop, "GET"))
 	mux.Handle("/api/v1/rules", enforceMethods(r.noop, "GET"))
 	mux.Handle("/api/v2/silences", enforceMethods(r.silences, "GET", "POST"))
@@ -59,12 +65,20 @@ func NewRoutes(upstream *url.URL, label string) *routes {
 }
 
 func (r *routes) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	lvalue := req.URL.Query().Get(r.label)
+	var lvalue string
+	if r.labelLocation == "header" {
+		lvalue = req.Header.Get(r.label)
+	} else {
+	  lvalue = req.URL.Query().Get(r.label)
+	}
 	if lvalue == "" {
 		http.Error(w, fmt.Sprintf("Bad request. The %q query parameter must be provided.", r.label), http.StatusBadRequest)
 		return
 	}
-	req = req.WithContext(withLabelValue(req.Context(), lvalue))
+
+	lvalues := strings.Split(lvalue, ",")
+
+	req = req.WithContext(withLabelValue(req.Context(), lvalues))
 	// Remove the proxy label from the query parameters.
 	q := req.URL.Query()
 	q.Del(r.label)
@@ -98,19 +112,39 @@ type ctxKey int
 
 const keyLabel ctxKey = iota
 
-func mustLabelValue(ctx context.Context) string {
-	label, ok := ctx.Value(keyLabel).(string)
+func mustLabelValue(ctx context.Context) []string {
+	lvalues, ok := ctx.Value(keyLabel).([]string)
 	if !ok {
 		panic(fmt.Sprintf("can't find the %q value in the context", keyLabel))
 	}
-	if label == "" {
+	if lvalues == nil || len(lvalues) == 0 {
 		panic(fmt.Sprintf("empty %q value in the context", keyLabel))
 	}
-	return label
+	return lvalues
 }
 
-func withLabelValue(ctx context.Context, label string) context.Context {
-	return context.WithValue(ctx, keyLabel, label)
+func createLabelMatcher(ctx context.Context, label string) *labels.Matcher {
+	lvalues := mustLabelValue(ctx)
+
+	fmt.Println("label " + label + " should be: " + strings.Join(lvalues, ","))
+	if len(lvalues) == 1 {
+		return &labels.Matcher{
+			Name:  label,
+			Type:  labels.MatchEqual,
+			Value: lvalues[0],
+		}
+	} else if len(lvalues) > 1 {
+		return &labels.Matcher{
+			Name:  label,
+			Type:  labels.MatchRegexp,
+			Value: "^(?:" + strings.Join(lvalues, "|") + ")$",
+		}
+	}
+	panic(fmt.Sprintf("label values has invalid size %d", len(lvalues)))
+}
+
+func withLabelValue(ctx context.Context, lvalues []string) context.Context {
+	return context.WithValue(ctx, keyLabel, lvalues)
 }
 
 func (r *routes) noop(w http.ResponseWriter, req *http.Request) {
@@ -124,11 +158,7 @@ func (r *routes) query(w http.ResponseWriter, req *http.Request) {
 	}
 
 	e := NewEnforcer([]*labels.Matcher{
-		{
-			Name:  r.label,
-			Type:  labels.MatchEqual,
-			Value: mustLabelValue(req.Context()),
-		},
+		createLabelMatcher(req.Context(), r.label),
 	}...)
 	if err := e.EnforceNode(expr); err != nil {
 		return
@@ -141,12 +171,40 @@ func (r *routes) query(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
 }
 
-func (r *routes) federate(w http.ResponseWriter, req *http.Request) {
-	matcher := &labels.Matcher{
-		Name:  r.label,
-		Type:  labels.MatchEqual,
-		Value: mustLabelValue(req.Context()),
+func (r *routes) series(w http.ResponseWriter, req *http.Request) {
+	if req.Form == nil {
+		req.ParseMultipartForm(32 << 20)
 	}
+	matches := req.Form["match[]"];
+	q := req.URL.Query()
+	q.Del("match[]")
+
+  if matches != nil {
+		for _, query := range matches {
+			expr, err := parser.ParseExpr(query)
+			if err != nil {
+				return
+			}
+
+			e := NewEnforcer([]*labels.Matcher{
+				createLabelMatcher(req.Context(), r.label),
+			}...)
+			if err := e.EnforceNode(expr); err != nil {
+				return
+			}
+
+			q.Add("match[]", expr.String())
+			fmt.Println("new query: " + expr.String())
+		}
+	}
+
+	req.URL.RawQuery = q.Encode()
+
+	r.handler.ServeHTTP(w, req)
+}
+
+func (r *routes) federate(w http.ResponseWriter, req *http.Request) {
+	matcher := createLabelMatcher(req.Context(), r.label)
 
 	q := req.URL.Query()
 	q.Set("match[]", "{"+matcher.String()+"}")

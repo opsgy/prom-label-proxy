@@ -46,11 +46,7 @@ func (r *routes) silences(w http.ResponseWriter, req *http.Request) {
 func (r *routes) listSilences(w http.ResponseWriter, req *http.Request) {
 	var (
 		q               = req.URL.Query()
-		proxyLabelMatch = labels.Matcher{
-			Type:  labels.MatchEqual,
-			Name:  r.label,
-			Value: mustLabelValue(req.Context()),
-		}
+		proxyLabelMatch = createLabelMatcher(req.Context(), r.label)
 		modified = []string{proxyLabelMatch.String()}
 	)
 	for _, filter := range q["filter"] {
@@ -75,7 +71,7 @@ func (r *routes) listSilences(w http.ResponseWriter, req *http.Request) {
 func (r *routes) postSilence(w http.ResponseWriter, req *http.Request) {
 	var (
 		sil    models.PostableSilence
-		lvalue = mustLabelValue(req.Context())
+		lvalues = mustLabelValue(req.Context())
 	)
 	if err := json.NewDecoder(req.Body).Decode(&sil); err != nil {
 		http.Error(w, fmt.Sprintf("bad request: can't decode: %v", err), http.StatusBadRequest)
@@ -90,15 +86,14 @@ func (r *routes) postSilence(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		if !hasMatcherForLabel(existing.Matchers, r.label, lvalue) {
+		if !hasMatcherForLabel(existing.Matchers, r.label, lvalues) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 	}
 
-	var falsy bool
 	modified := models.Matchers{
-		&models.Matcher{Name: &(r.label), Value: &lvalue, IsRegex: &falsy},
+		createMatcher(r.label, lvalues),
 	}
 	for _, m := range sil.Matchers {
 		if m.Name != nil && *m.Name == r.label {
@@ -166,11 +161,35 @@ func (r *routes) getSilenceByID(ctx context.Context, id string) (*models.Gettabl
 	return sil.Payload, nil
 }
 
-func hasMatcherForLabel(matchers models.Matchers, name, value string) bool {
+func hasMatcherForLabel(matchers models.Matchers, name string, values []string) bool {
 	for _, m := range matchers {
-		if *m.Name == name && !*m.IsRegex && *m.Value == value {
-			return true
+		if *m.Name == name && !*m.IsRegex {
+			for _, value := range values {
+				if value == *m.Value {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+func createMatcher(label string, values []string) *models.Matcher {
+	var falsy bool = false
+	var truely bool = true
+	if len(values) == 1 {
+		return &models.Matcher{
+			Name: &(label),
+			IsRegex: &falsy,
+			Value: &values[0],
+		}
+	} else if len(values) > 1 {
+		regex := "^(?:" + strings.Join(values, "|") + ")$"
+		return &models.Matcher{
+			Name: &(label),
+			IsRegex: &truely,
+			Value: &(regex),
+		}
+	}
+	panic(fmt.Sprintf("label values has invalid size %d", len(values)))
 }
