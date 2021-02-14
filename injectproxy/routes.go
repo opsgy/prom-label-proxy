@@ -16,6 +16,7 @@ package injectproxy
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -23,6 +24,11 @@ import (
 
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+)
+
+const (
+	queryParam    = "query"
+	matchersParam = "match[]"
 )
 
 type routes struct {
@@ -34,7 +40,33 @@ type routes struct {
 	modifiers     map[string]func(*http.Response) error
 }
 
-func NewRoutes(upstream *url.URL, label string, labelLocation string) *routes {
+type options struct {
+	enableLabelAPIs bool
+}
+
+type Option interface {
+	apply(*options)
+}
+
+type optionFunc func(*options)
+
+func (f optionFunc) apply(o *options) {
+	f(o)
+}
+
+// WithEnabledLabelsAPI enables proxying to labels API. If false, "501 Not implemented" will be return for those.
+func WithEnabledLabelsAPI() Option {
+	return optionFunc(func(o *options) {
+		o.enableLabelAPIs = true
+	})
+}
+
+func NewRoutes(upstream *url.URL, label string, labelLocation string, opts ...Option) *routes {
+	opt := options{}
+	for _, o := range opts {
+		o.apply(&opt)
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
 	r := &routes{
@@ -44,14 +76,20 @@ func NewRoutes(upstream *url.URL, label string, labelLocation string) *routes {
 		labelLocation: labelLocation,
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/federate", enforceMethods(r.federate, "GET"))
+	mux.Handle("/federate", enforceMethods(r.matcher, "GET"))
 	mux.Handle("/api/v1/query", enforceMethods(r.query, "GET", "POST"))
 	mux.Handle("/api/v1/query_range", enforceMethods(r.query, "GET", "POST"))
-	mux.Handle("/api/v1/series", enforceMethods(r.series, "GET", "POST"))
-	mux.Handle("/api/v1/labels", enforceMethods(r.noop, "GET"))
-	mux.Handle("/api/v1/label/__name__/values", enforceMethods(r.noop, "GET"))
 	mux.Handle("/api/v1/alerts", enforceMethods(r.noop, "GET"))
 	mux.Handle("/api/v1/rules", enforceMethods(r.noop, "GET"))
+	mux.Handle("/api/v1/series", enforceMethods(r.matcher, "GET"))
+
+	if opt.enableLabelAPIs {
+		mux.Handle("/api/v1/labels", enforceMethods(r.matcher, "GET"))
+		// Full path is /api/v1/label/<label_name>/values but http mux does not support patterns.
+		// This is fine though as we don't care about name for matcher injector.
+		mux.Handle("/api/v1/label/", enforceMethods(r.matcher, "GET"))
+	}
+
 	mux.Handle("/api/v2/silences", enforceMethods(r.silences, "GET", "POST"))
 	mux.Handle("/api/v2/silences/", enforceMethods(r.silences, "GET", "POST"))
 	mux.Handle("/api/v2/silence/", enforceMethods(r.deleteSilence, "DELETE"))
@@ -69,7 +107,7 @@ func (r *routes) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if r.labelLocation == "header" {
 		lvalue = req.Header.Get(r.label)
 	} else {
-	  lvalue = req.URL.Query().Get(r.label)
+		lvalue = req.URL.Query().Get(r.label)
 	}
 	if lvalue == "" {
 		http.Error(w, fmt.Sprintf("Bad request. The %q query parameter must be provided.", r.label), http.StatusBadRequest)
@@ -152,54 +190,88 @@ func (r *routes) noop(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {
-	expr, err := parser.ParseExpr(req.FormValue("query"))
-	if err != nil {
-		return
-	}
-
 	e := NewEnforcer([]*labels.Matcher{
 		createLabelMatcher(req.Context(), r.label),
 	}...)
-	if err := e.EnforceNode(expr); err != nil {
+
+	// The `query` can come in the URL query string and/or the POST body.
+	// For this reason, we need to try to enforcing in both places.
+	// Note: a POST request may include some values in the URL query string
+	// and others in the body. If both locations include a `query`, then
+	// enforce in both places.
+	q, found1, err := enforceQueryValues(e, req.URL.Query())
+	if err != nil {
 		return
 	}
+	req.URL.RawQuery = q
 
-	q := req.URL.Query()
-	q.Set("query", expr.String())
-	req.URL.RawQuery = q.Encode()
+	var found2 bool
+	// Enforce the query in the POST body if needed.
+	if req.Method == http.MethodPost {
+		if err := req.ParseForm(); err != nil {
+			return
+		}
+		q, found2, err = enforceQueryValues(e, req.PostForm)
+		if err != nil {
+			return
+		}
+		// We are replacing request body, close previous one (ParseForm ensures it is read fully and not nil).
+		_ = req.Body.Close()
+		req.Body = ioutil.NopCloser(strings.NewReader(q))
+		req.ContentLength = int64(len(q))
+	}
+
+	// If no query was found, return early.
+	if !found1 && !found2 {
+		return
+	}
 
 	r.handler.ServeHTTP(w, req)
 }
 
-func (r *routes) series(w http.ResponseWriter, req *http.Request) {
-	if req.Form == nil {
-		req.ParseMultipartForm(32 << 20)
+func enforceQueryValues(e *Enforcer, v url.Values) (values string, noQuery bool, err error) {
+	// If no values were given or no query is present,
+	// e.g. because the query came in the POST body
+	// but the URL query string was passed, then finish early.
+	if v.Get(queryParam) == "" {
+		return v.Encode(), false, nil
 	}
-	matches := req.Form["match[]"];
-	q := req.URL.Query()
-	q.Del("match[]")
+	expr, err := parser.ParseExpr(v.Get(queryParam))
+	if err != nil {
+		return "", true, err
+	}
 
-  if matches != nil {
-		for _, query := range matches {
-			expr, err := parser.ParseExpr(query)
+	if err := e.EnforceNode(expr); err != nil {
+		return "", true, err
+	}
+
+	v.Set(queryParam, expr.String())
+	return v.Encode(), true, nil
+}
+
+// matcher ensures all the provided match[] if any has label injected. If none was provided, single matcher is injected.
+// This works for non-query Prometheus APIs like: /api/v1/series, /api/v1/label/<name>/values, /api/v1/labels and /federate support multiple matchers.
+// See e.g https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metadata
+func (r *routes) matcher(w http.ResponseWriter, req *http.Request) {
+	matcher := createLabelMatcher(req.Context(), r.label)
+
+	q := req.URL.Query()
+	matchers := q[matchersParam]
+	if len(matchers) == 0 {
+		q.Set(matchersParam, matchersToString(matcher))
+	} else {
+		// Inject label to existing matchers.
+		for i, m := range matchers {
+			ms, err := parser.ParseMetricSelector(m)
 			if err != nil {
 				return
 			}
-
-			e := NewEnforcer([]*labels.Matcher{
-				createLabelMatcher(req.Context(), r.label),
-			}...)
-			if err := e.EnforceNode(expr); err != nil {
-				return
-			}
-
-			q.Add("match[]", expr.String())
-			fmt.Println("new query: " + expr.String())
+			matchers[i] = matchersToString(append(ms, matcher)...)
 		}
+		q[matchersParam] = matchers
 	}
 
 	req.URL.RawQuery = q.Encode()
-
 	r.handler.ServeHTTP(w, req)
 }
 
@@ -207,8 +279,29 @@ func (r *routes) federate(w http.ResponseWriter, req *http.Request) {
 	matcher := createLabelMatcher(req.Context(), r.label)
 
 	q := req.URL.Query()
-	q.Set("match[]", "{"+matcher.String()+"}")
-	req.URL.RawQuery = q.Encode()
+	matchers := q[matchersParam]
+	if len(matchers) == 0 {
+		q.Set(matchersParam, matchersToString(matcher))
+	} else {
+		// Inject label to existing matchers.
+		for i, m := range matchers {
+			ms, err := parser.ParseMetricSelector(m)
+			if err != nil {
+				return
+			}
+			matchers[i] = matchersToString(append(ms, matcher)...)
+		}
+		q[matchersParam] = matchers
+	}
 
+	req.URL.RawQuery = q.Encode()
 	r.handler.ServeHTTP(w, req)
+}
+
+func matchersToString(ms ...*labels.Matcher) string {
+	var el []string
+	for _, m := range ms {
+		el = append(el, m.String())
+	}
+	return fmt.Sprintf("{%v}", strings.Join(el, ","))
 }
